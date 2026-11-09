@@ -8,13 +8,13 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .errors import BulkError, JobBlocked, UsageError
-from .jobs import JobManager
+from .jobs import EXPORT_FORMATS, JobManager
 
 logger = logging.getLogger(__name__)
 
 ARGS_HINT = (
     '"<instruction>" --over <path> | run <job_id> | status [job_id] | '
-    "pause <job_id> | resume <job_id> | retry <job_id>"
+    "pause <job_id> | resume <job_id> | retry <job_id> | export <job_id>"
 )
 
 USAGE = """Usage:
@@ -31,10 +31,13 @@ USAGE = """Usage:
       Continue a paused job, optionally with a new token limit.
   /bulk retry <job_id>
       Return failed items to pending and process them.
+  /bulk export <job_id> [--format md|csv]
+      Write all of a job's results into one file. Makes no model calls.
 
 --max-tokens is enforced by Bulk from reported usage and estimates. It is not a
 provider billing limit. --retries is the number of automatic retries per item.
---concurrency is how many items run at once (default 4).
+--concurrency is how many items run at once (default 4). When the provider rate
+limits Bulk, all workers wait and try again, and --retries 0 turns this off.
 
 Background work runs inside the Hermes gateway and stops if the gateway stops. Run
 /bulk run <job_id> again after a restart to continue."""
@@ -88,6 +91,8 @@ class BulkCommands:
             return self._status(arguments[0] if arguments else None)
         if command == "resume" and arguments:
             return self._resume(arguments)
+        if command == "export" and arguments:
+            return self._export(arguments)
         if command in ("run", "pause", "retry") and len(arguments) == 1:
             handler = {"run": self._run, "pause": self._pause, "retry": self._retry}[command]
             return handler(arguments[0])
@@ -197,6 +202,26 @@ class BulkCommands:
             first = f"Job {job_id} has no failed items."
         return f"{first}\n\n{self._job_text(manager, job_id)}"
 
+    def _export(self, arguments: list[str]) -> str:
+        job_id = arguments[0]
+        fmt = "md"
+        if len(arguments) == 3 and arguments[1] == "--format":
+            fmt = arguments[2].lower()
+            if fmt not in EXPORT_FORMATS:
+                raise UsageError("--format must be md or csv")
+        elif len(arguments) != 1:
+            raise UsageError("usage: /bulk export <job_id> [--format md|csv]")
+        exported = self._manager().export(job_id, fmt)
+        total = exported.included + exported.failed + exported.unfinished + exported.missing
+        lines = [f"Exported {exported.included} of {_count(total, 'result')} to {exported.path}"]
+        if exported.failed:
+            lines.append(f"{_count(exported.failed, 'failed item')} listed without a result. Reprocess with: /bulk retry {job_id}")
+        if exported.unfinished:
+            lines.append(f"{_count(exported.unfinished, 'item')} not finished yet. Export again when the job is done.")
+        if exported.missing:
+            lines.append(f"{_count(exported.missing, 'completed item')} had no result file.")
+        return "\n".join(lines)
+
     def _status(self, job_id: Optional[str]) -> str:
         manager = self._manager()
         if job_id is not None:
@@ -223,7 +248,8 @@ class BulkCommands:
         if job["status"] == "paused":
             return f"paused ({running} in progress may still finish)" if running else "paused"
         if manager.background.is_active(job_id):
-            return "processing"
+            waiting = manager.rate_limit.remaining()
+            return f"processing (rate limited by the provider, waiting {waiting:.0f}s)" if waiting else "processing"
         if running and manager.claims_held_by_live_process(job_id):
             return "processing in another Hermes process"
         if running or any(item["attempts"] for item in items):
@@ -266,6 +292,8 @@ class BulkCommands:
             lines.append(f"Reported cost: ${job['spent_usd']:.4f}")
         lines.append(self._concurrency_text(job))
         lines.append(f"Automatic retries per item: {job['max_retries']}")
+        if job["completed_items"]:
+            lines.append(f"Combine results into one file with: /bulk export {job_id}")
         lines.append("Recent events:")
         lines.extend(
             f"  {event['created_at']} {event['event_type']}: {event['message']}"
