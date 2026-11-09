@@ -1,0 +1,13 @@
+name: bulk
+version: 0.4.0
+description: "Apply one instruction to hundreds of independent files, CSV rows or JSON records, with job state stored in SQLite."
+requires_hermes: ">=0.23.0"
+config_schema:
+  max_retries:
+    type: int
+    default: 2
+    description: "Automatic retries per item after a transient model failure. Override per job with --retries."
+  max_concurrency:
+    type: int
+    default: 16
+    description: "The most items one job may process at once. --concurrency cannot exceed this."
