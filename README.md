@@ -2,7 +2,7 @@
 
 Bulk is a Hermes Agent plugin that applies one instruction to many independent items: files in a directory, CSV rows, or JSON records. Job state lives in SQLite, outside the conversation.
 
-`/bulk run` processes a whole job in the background with bounded concurrency. Bulk retries transient model failures, recovers interrupted items, and supports pause, resume and token limits. Each item's result is saved as its own file; Bulk does not merge results into one document.
+`/bulk run` processes a whole job in the background with bounded concurrency. Bulk retries transient model failures, recovers interrupted items, and supports pause, resume and token limits. Each item's result is saved as its own file, and `/bulk export` combines them into one Markdown or CSV file.
 
 Bulk requires Hermes Agent v0.23.0 or later and has been tested on v0.23.0. It has no Python dependencies beyond the standard library.
 
@@ -15,6 +15,7 @@ Bulk requires Hermes Agent v0.23.0 or later and has been tested on v0.23.0. It h
 /bulk pause <job_id>
 /bulk resume <job_id> [--max-tokens <n>]
 /bulk retry <job_id>
+/bulk export <job_id> [--format md|csv]
 ```
 
 `/bulk resume` and `/bulk retry` also start background processing, unless the job is paused.
@@ -26,7 +27,8 @@ Bulk requires Hermes Agent v0.23.0 or later and has been tested on v0.23.0. It h
 - **Concurrency.** `--concurrency` sets how many items run at once (default 4). The `max_concurrency` plugin setting caps it (default 16). A job never has more than that many workers in one process, and each item is claimed atomically, so two workers cannot hold the same item.
 - **Background work stops when the gateway stops.** Nothing runs outside Hermes. After a restart, `/bulk status` shows `awaiting recovery`; run `/bulk run <job_id>` to continue. Jobs do not restart by themselves, so a restart never spends tokens without you asking.
 - **Keep the gateway running.** A gateway that a Hermes client started by itself exits after 10 minutes with no clients attached, and Bulk's workers do not count as activity. For long jobs, keep a Hermes session open, run `hermes gateway run`, or set `gateway.unmanaged_idle_exit_seconds: 0` in `config.yaml`.
-- **Rate limits.** Higher concurrency makes provider rate limits more likely, and the default retries wait only a few seconds. On a rate-limited model, use a lower `--concurrency` or more retries (`--retries 6` waits about 90 seconds in total per item). Items that run out of retries are marked failed, and `/bulk retry` returns them to the queue.
+- **Rate limits.** When the provider answers HTTP 429, every worker waits together and then tries again. Bulk uses the provider's `Retry-After` when it sends one; otherwise it waits 5 seconds, doubling to at most 2 minutes. An item gives up after 8 such waits, about 9 minutes in total, and is marked failed; `/bulk retry` returns it to the queue. These waits do not use up `--retries`, and `--retries 0` turns them off. `/bulk status` shows when Bulk is waiting.
+- **Combined results.** `/bulk export` writes `results.md` or `results.csv` in the job's folder, in item order, and makes no model calls. It can be run at any time; failed and unfinished items are listed without a result. In CSV files, cells that start with `=`, `+`, `-` or `@` get a leading `'` so a spreadsheet does not run them as formulas.
 
 ## Reliability
 
@@ -89,7 +91,7 @@ For the live check, start `hermes` and run these, using the job id that the firs
 
 ## Data and disclosures
 
-- Jobs are stored in `<hermes home>/plugin-data/bulk/data.db`, and results in `<hermes home>/plugin-data/bulk/jobs/<job_id>/outputs/`.
+- Jobs are stored in `<hermes home>/plugin-data/bulk/data.db`, and results in `<hermes home>/plugin-data/bulk/jobs/<job_id>/`.
 - **Reads outside the plugin's data:** Bulk reads the paths you pass to `--over`, including paths outside its data directory.
 - Each processed item is sent to your configured model provider through `ctx.llm`, and that usage is billed to your provider account.
 - Each running Hermes process keeps a small lock file in `<hermes home>/plugin-data/bulk/workers/` so that recovery can tell whether a claim's owner is still alive.
