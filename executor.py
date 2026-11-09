@@ -66,6 +66,24 @@ def _status_code(exc: BaseException) -> Optional[int]:
     return status if isinstance(status, int) else None
 
 
+def is_rate_limited(exc: BaseException) -> bool:
+    if _status_code(exc) == 429:
+        return True
+    return any(cls.__name__ == "RateLimitError" for cls in type(exc).__mro__)
+
+
+def retry_after_seconds(exc: BaseException) -> Optional[float]:
+    """The provider's ``Retry-After`` delay in seconds, if it sent a numeric one."""
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    if headers is None:
+        return None
+    try:
+        seconds = float(headers.get("retry-after"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return seconds if 0 < seconds < math.inf else None
+
+
 def describe_error(exc: BaseException) -> str:
     """Error text that is safe to store in the job and show in ``/bulk status``.
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +25,44 @@ logger = logging.getLogger(__name__)
 
 MAX_BACKOFF_SECONDS = 30
 SHUTDOWN_GRACE_SECONDS = 5.0
+MAX_RATE_LIMIT_WAITS = 8  # per item; with the delays below, roughly 9 minutes in total
+RATE_LIMIT_FIRST_WAIT_SECONDS = 5.0
+RATE_LIMIT_MAX_WAIT_SECONDS = 120.0
+EXPORT_FORMATS = ("md", "csv")
+
+
+class RateLimitGate:
+    """A wait shared by every worker in this process, because a rate limit is per account.
+
+    Workers that hit the limit during the same wait do not lengthen it. The wait doubles
+    only if the limit is hit again after a wait has ended, and resets after a success.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._until = 0.0
+        self._strikes = 0
+
+    def hit(self, retry_after: Optional[float] = None) -> float:
+        """Record a rate-limit response. Returns the seconds left to wait."""
+        with self._lock:
+            now = self._clock()
+            if now >= self._until:
+                self._strikes += 1
+                backoff = RATE_LIMIT_FIRST_WAIT_SECONDS * 2 ** (self._strikes - 1)
+                delay = min(max(retry_after or 0.0, backoff), RATE_LIMIT_MAX_WAIT_SECONDS)
+                self._until = now + delay
+            return self._until - now
+
+    def success(self) -> None:
+        with self._lock:
+            if self._clock() >= self._until:
+                self._strikes = 0
+
+    def remaining(self) -> float:
+        with self._lock:
+            return max(0.0, self._until - self._clock())
 
 
 @dataclass(frozen=True)
@@ -62,6 +101,7 @@ class JobManager:
         self.data_dir = data_dir
         self._llm = llm
         self._sleep = sleep
+        self.rate_limit = RateLimitGate()
         self.worker = WorkerLock(data_dir / "workers")
         self.background = BackgroundWorkers(self, draining)
         self.recover()
@@ -177,12 +217,20 @@ class JobManager:
         self.get_job(job_id)
         return self.store.retry_failed(job_id)
 
+    def export(self, job_id: str, fmt: str = "md") -> results.Export:
+        """Write the job's results into one file. Makes no model calls."""
+        job = self.get_job(job_id)
+        return results.write_export(self.data_dir, job, self.store.get_items(job_id), fmt)
+
     # ── Processing ──────────────────────────────────────────────────────────
 
     def process_next(self, job_id: str) -> Optional[ProcessedItem]:
         """Process the next pending item, or return ``None`` if there is none."""
         job = self.get_job(job_id)
         self.recover(job_id)
+        self._wait_out_rate_limit()
+        if self.background.stopping():
+            return None
         item = self.store.claim_next(job_id, self.worker.id)
         if item is None:
             return None
@@ -232,13 +280,38 @@ class JobManager:
             raise
         return ProcessedItem(row["item_key"], ok=True, output_path=final, result=outcome)
 
+    def _wait_out_rate_limit(self) -> None:
+        remaining = self.rate_limit.remaining()
+        if remaining > 0:
+            self._sleep(remaining)
+
     def _call_model(self, job: sqlite3.Row, row: sqlite3.Row, item: discovery.Item) -> executor.ItemResult:
         max_attempts = job["max_retries"] + 1
+        # --retries 0 means no retries of any kind.
+        max_rate_waits = MAX_RATE_LIMIT_WAITS if job["max_retries"] else 0
         attempt = 1
+        rate_waits = 0
         while True:
+            self._wait_out_rate_limit()
+            if self.background.stopping():
+                raise ShuttingDown("stopped before the model call")
             try:
-                return executor.run_item(self._llm, job["instruction"], item)
+                outcome = executor.run_item(self._llm, job["instruction"], item)
+                self.rate_limit.success()
+                return outcome
             except Exception as exc:
+                if executor.is_rate_limited(exc) and rate_waits < max_rate_waits:
+                    rate_waits += 1
+                    logger.warning("Bulk item %s was rate limited: %s", item.key, exc)
+                    wait = self.rate_limit.hit(executor.retry_after_seconds(exc))
+                    self.store.record_failed_attempt(
+                        row["id"],
+                        self.worker.id,
+                        f"{executor.describe_error(exc)}; waiting {wait:.0f}s",
+                        rate_waits,
+                        max_rate_waits,
+                    )
+                    continue
                 if attempt >= max_attempts or not executor.is_transient(exc):
                     raise
                 logger.warning("Bulk item %s attempt %d failed: %s: %s", item.key, attempt, type(exc).__name__, exc)
